@@ -352,13 +352,20 @@ def edf_to_segment_h5s(
         return 0
 
     n_ch, n_t = signal.shape
+    ch_names_after = list(raw.ch_names)
+    # Reorder to TUEV_CHANNEL_ORDER so verify and downstream code see consistent order
+    if set(ch_names_after) != set(TUEV_CHANNEL_ORDER):
+        return 0
+    order_idx = [ch_names_after.index(ch) for ch in TUEV_CHANNEL_ORDER]
+    signal = signal[order_idx]
+    ch_names_after = list(TUEV_CHANNEL_ORDER)
+
     n_samples_per_segment = int(sfreq * segment_sec)  # 1000 at 200 Hz
     events = read_events_for_edf(edf_path)
     if not events:
         return 0
 
     edf_stem = os.path.basename(edf_path).replace(".edf", "").replace(".EDF", "").replace(".rec", "")
-    ch_names_after = raw.ch_names
     written = 0
     for evt_idx, evt in enumerate(events):
         start_idx = int(evt["start_sec"] * sfreq)
@@ -456,7 +463,7 @@ def verify_h5_files(save_folder: str, data_folder: Optional[str] = None) -> bool
                     data_like = [k for k in g.keys() if k in TUEV_CHANNEL_ORDER]
                     ch_names = sorted(data_like) if data_like else []
 
-                if ch_names != TUEV_CHANNEL_ORDER:
+                if set(ch_names) != set(TUEV_CHANNEL_ORDER) or len(ch_names) != len(TUEV_CHANNEL_ORDER):
                     print(f"  FAIL {basename}: ch_names mismatch. Got {len(ch_names)} channels, expected {len(TUEV_CHANNEL_ORDER)}. Names: {ch_names}")
                     all_ok = False
                     continue
