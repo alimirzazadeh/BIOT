@@ -54,30 +54,49 @@ def merge_adjacent_segments(df, fs=200):
     return out[[c for c in df.columns if c in out.columns]]
 
 
+def _annotation_files_under(root: str) -> list[tuple[str, str]]:
+    """(path, stem) for each annotation file. stem is the EDF-matching name (e.g. 'x' for x.rec or x_rec.edf)."""
+    out = []
+    for dirpath, _dirnames, filenames in os.walk(root):
+        for f in filenames:
+            base, ext = os.path.splitext(f)
+            path = os.path.join(dirpath, f)
+            if ext.lower() == ".rec":
+                out.append((path, base))
+            elif base.endswith("_rec") and ext.lower() == ".edf":
+                out.append((path, base[: -len("_rec")]))  # x_rec.edf -> stem x
+            elif base.endswith("_events") and ext.lower() in (".edf", ".csv"):
+                out.append((path, base[: -len("_events")]))  # x_events.edf -> stem x
+            else:
+                continue
+    return out
+
+
 def load_tuev_labels(fs=250, data_folder: Optional[str] = None):
     """Load TUEV annotations. Returns DataFrame with filename, start_time, end_time, label (int). Adjacent same-label segments are merged.
-    If data_folder is given, discover .rec files under it; otherwise use default path."""
+    Discovers .rec, *_rec.edf, *_events.edf, *_events.csv under data_folder (or default path)."""
     if data_folder is not None:
         txt_dir = data_folder
     else:
         txt_dir = '/orcd/compute/dinaktbi/001/2026/EEG_FM/EXTERNAL_DATASETS/TUEV/data/v2.0.1/edf/'
-    txt_files = [os.path.join(item[0], ii) for item in os.walk(txt_dir) for ii in item[2] if ii.endswith('.rec')]
+    annotation_list = _annotation_files_under(txt_dir)
     df_list = []
-    for rec_file in txt_files:
-        event_data = np.genfromtxt(rec_file, delimiter=",")
-
+    for rec_file, stem in annotation_list:
+        try:
+            event_data = np.genfromtxt(rec_file, delimiter=",")
+        except Exception:
+            continue
+        if event_data.size == 0:
+            continue
         if event_data.ndim == 1:
             event_data = event_data.reshape(1, -1)
-
         records = []
         for row in event_data:
             start_time = float(row[1])
             end_time = float(row[2])
             label = int(row[3])
-
             start_idx = int(start_time * fs)
             end_idx = int(end_time * fs)
-
             records.append({
                 "start_time": start_time,
                 "end_time": end_time,
@@ -85,10 +104,11 @@ def load_tuev_labels(fs=250, data_folder: Optional[str] = None):
                 "end_idx": end_idx,
                 "label": label
             })
-
         df = pd.DataFrame(records, columns=["start_time", "end_time", "start_idx", "end_idx", "label"])
-        df['filename'] = rec_file.split('/')[-1].split('.')[0]
+        df["filename"] = stem
         df_list.append(df)
+    if not df_list:
+        return pd.DataFrame(columns=["start_time", "end_time", "start_idx", "end_idx", "label", "filename"])
     df = pd.concat(df_list).reset_index(drop=True)
     return merge_adjacent_segments(df, fs=fs)
 
@@ -97,20 +117,16 @@ def load_tuev_labels(fs=250, data_folder: Optional[str] = None):
 PAD_SEC = 2.0
 
 
-def read_events_for_edf(edf_path: str) -> list[dict]:
-    """
-    Read .rec file next to the EDF and return segments using process.py logic:
-    for each event row (chan, start_time, end_time, label), segment is
-    (start_time - PAD_SEC, end_time + PAD_SEC) in seconds.
-    Returns list of {"start_sec", "end_sec", "label"}.
-    """
-    rec_path = os.path.join(
-        os.path.dirname(edf_path),
-        os.path.basename(edf_path).replace(".edf", "").replace(".EDF", "") + ".rec",
-    )
-    if not os.path.isfile(rec_path):
+def _read_event_file(candidate_path: str) -> list[dict]:
+    """Read one annotation file (CSV: chan, start_time, end_time, label). Returns events with process.py padding."""
+    if not os.path.isfile(candidate_path):
         return []
-    event_data = np.genfromtxt(rec_path, delimiter=",")
+    try:
+        event_data = np.genfromtxt(candidate_path, delimiter=",")
+    except Exception:
+        return []
+    if event_data.size == 0:
+        return []
     if event_data.ndim == 1:
         event_data = event_data.reshape(1, -1)
     events = []
@@ -123,6 +139,28 @@ def read_events_for_edf(edf_path: str) -> list[dict]:
         if start_sec < end_sec:
             events.append({"start_sec": start_sec, "end_sec": end_sec, "label": label})
     return events
+
+
+def read_events_for_edf(edf_path: str) -> list[dict]:
+    """
+    Read annotation file next to the EDF (same CSV format as .rec): chan, start_time, end_time, label.
+    Tries, in order: {stem}.rec, {stem}_rec.edf, {stem}_events.edf, {stem}_events.csv.
+    Uses process.py logic: segment = (start_time - PAD_SEC, end_time + PAD_SEC).
+    Returns list of {"start_sec", "end_sec", "label"}.
+    """
+    dirpath = os.path.dirname(edf_path)
+    stem = os.path.basename(edf_path).replace(".edf", "").replace(".EDF", "")
+    candidates = [
+        os.path.join(dirpath, stem + ".rec"),
+        os.path.join(dirpath, stem + "_rec.edf"),
+        os.path.join(dirpath, stem + "_events.edf"),
+        os.path.join(dirpath, stem + "_events.csv"),
+    ]
+    for rec_path in candidates:
+        events = _read_event_file(rec_path)
+        if events:
+            return events
+    return []
 
 
 # Channel names we keep after mapping (same logic as reference CHANNEL_ORDER for TUEV).
@@ -480,6 +518,7 @@ def prepare_tuev(
 
     os.makedirs(save_folder, exist_ok=True)
     total_h5 = 0
+    no_events_count = 0
     for edf_file in tqdm(edf_files, desc="TUEV EDF → H5 (per channel)"):
         n = edf_to_segment_h5s(
             edf_file,
@@ -489,8 +528,16 @@ def prepare_tuev(
             segment_sec=5.0,
         )
         total_h5 += n
+        if n == 0:
+            no_events_count += 1
     if total_h5:
         print(f"Wrote {total_h5} segment H5 files to {save_folder}")
+    elif no_events_count:
+        print(
+            f"No H5 files written: none of the {len(edf_files)} EDF(s) had annotation data. "
+            "Per EDF we look for (in same directory): {stem}.rec, {stem}_rec.edf, {stem}_events.edf, {stem}_events.csv "
+            "(CSV format: chan, start_time, end_time, label). If you renamed .rec → .edf, use _rec.edf or _events.csv for annotations."
+        )
 
 
 def main() -> None:
