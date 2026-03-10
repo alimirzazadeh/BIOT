@@ -88,6 +88,39 @@ def load_tuev_labels(fs=250):
     df = pd.concat(df_list).reset_index(drop=True)
     return merge_adjacent_segments(df, fs=fs)
 
+
+# Segment logic from process.py BuildEvents: each event window is (start_time - PAD_SEC, end_time + PAD_SEC).
+PAD_SEC = 2.0
+
+
+def read_events_for_edf(edf_path: str) -> list[dict]:
+    """
+    Read .rec file next to the EDF and return segments using process.py logic:
+    for each event row (chan, start_time, end_time, label), segment is
+    (start_time - PAD_SEC, end_time + PAD_SEC) in seconds.
+    Returns list of {"start_sec", "end_sec", "label"}.
+    """
+    rec_path = os.path.join(
+        os.path.dirname(edf_path),
+        os.path.basename(edf_path).replace(".edf", "").replace(".EDF", "") + ".rec",
+    )
+    if not os.path.isfile(rec_path):
+        return []
+    event_data = np.genfromtxt(rec_path, delimiter=",")
+    if event_data.ndim == 1:
+        event_data = event_data.reshape(1, -1)
+    events = []
+    for row in event_data:
+        start_time = float(row[1])
+        end_time = float(row[2])
+        label = int(row[3])
+        start_sec = start_time - PAD_SEC
+        end_sec = end_time + PAD_SEC
+        if start_sec < end_sec:
+            events.append({"start_sec": start_sec, "end_sec": end_sec, "label": label})
+    return events
+
+
 # Channel names we keep after mapping (same logic as reference CHANNEL_ORDER for TUEV).
 # Must match the values in TUEV_CHANNEL_MAPPING below.
 TUEV_CHANNEL_ORDER = [
@@ -180,105 +213,139 @@ def preprocess_data(raw: mne.io.Raw) -> tuple[Optional[np.ndarray], Optional[flo
     return signal, target_fs
 
 
-def build_index(h5_path: str, group_name: str = "recording") -> None:
+def build_index(h5_path: str, group_name: str = "recording", n_samples: Optional[int] = None) -> None:
     """
-    Create an index dataset under group: one segment [start_sample, end_sample]
-    for the full recording, so downstream code that expects 'index' can use it.
+    Create an index dataset under group: one segment [0, n_samples].
+    If n_samples is None, infer from first channel dataset.
     """
     with h5py.File(h5_path, "a") as f:
         if group_name not in f:
             return
         g = f[group_name]
-        # Infer length from first channel dataset (e.g. fp1)
         ch_names = list(g.keys())
         data_like = [k for k in ch_names if k not in ("ch_names", "bad_channels", "index")]
-        if not data_like:
+        if not data_like and n_samples is None:
             return
-        first_ch = data_like[0]
-        n_samples = g[first_ch].shape[0]
+        if n_samples is None:
+            n_samples = g[data_like[0]].shape[0]
         if "index" in g:
             del g["index"]
         g.create_dataset("index", data=np.array([[0, n_samples]], dtype=np.int64))
 
 
-def edf_to_h5_per_channel(
-    edf_path: str,
+def write_one_segment_h5(
+    signal_slice: np.ndarray,
     h5_path: str,
+    ch_names: list[str],
+    raw: mne.io.Raw,
+    edf_path: str,
+    label: int,
     target_units: str = "uV",
     compression: str = "lzf",
-    chunk_sec: float = 5.0,
+    sfreq: float = 200.0,
 ) -> None:
     """
-    Convert one TUEV EDF to one HDF5 file with each channel as a separate dataset.
-
-    - Applies TUEV channel mapping and preprocessing (same as reference).
-    - Writes group "recording" with:
-      - One dataset per channel: recording/<ch_name> shape (n_t,) float32
-      - ch_names: array of channel names (order preserved)
-      - bad_channels: array (possibly empty)
-      - attrs: fs, units, start_time_iso, source_path
-    - Optionally builds index (one segment for full recording).
+    Write a single 5-second segment (signal_slice shape (n_ch, 1000)) to one HDF5 file.
     """
-    raw = mne.io.read_raw_edf(edf_path, preload=False, verbose="ERROR")
-
-    existing = set(raw.ch_names)
-    safe_mapping = {k: v for k, v in TUEV_CHANNEL_MAPPING.items() if k in existing}
-    if safe_mapping:
-        raw.rename_channels(safe_mapping)
-
-    try:
-        signal, sfreq = preprocess_data(raw)
-    except Exception as e:
-        print(f"Preprocess failed for {edf_path}: {e}")
-        return
-    if signal is None or sfreq is None:
-        return
-
-    # signal: (n_ch, n_t)
-    n_ch, n_t = signal.shape
-    signal = signal.astype(np.float32)
+    n_ch, n_t = signal_slice.shape
+    signal_slice = signal_slice.astype(np.float32)
     if target_units == "uV":
-        signal *= 1e6
-
-    ch_names_after = raw.ch_names  # order after rename and drop
+        signal_slice *= 1e6
     str_dt = h5py.string_dtype("utf-8")
-    chunk_t = max(1, int(sfreq * chunk_sec))
-
+    chunk_t = min(n_t, max(1, int(sfreq * 5.0)))
     os.makedirs(os.path.dirname(h5_path) or ".", exist_ok=True)
-
-    with h5py.File(h5_path, "a") as f:
+    with h5py.File(h5_path, "w") as f:
         gname = "recording"
-        g = f.require_group(gname)
-
-        # Remove existing per-channel datasets and metadata so re-run is clean
-        for key in list(g.keys()):
-            if key in ("ch_names", "bad_channels", "index") or key in TUEV_CHANNEL_ORDER:
-                del g[key]
-
-        for i, ch in enumerate(ch_names_after):
-            # HDF5 dataset names must be valid; channel names are already safe (e.g. fp1, fz)
+        g = f.create_group(gname)
+        for i, ch in enumerate(ch_names):
             dset = g.create_dataset(
                 ch,
-                data=signal[i],
-                chunks=(min(chunk_t, n_t),),
+                data=signal_slice[i],
+                chunks=(chunk_t,),
                 compression=compression,
             )
             dset.attrs["channel"] = ch
-
-        g.create_dataset("ch_names", data=np.array(ch_names_after, dtype=str_dt))
+        g.create_dataset("ch_names", data=np.array(ch_names, dtype=str_dt))
         g.create_dataset(
             "bad_channels",
             data=np.array(raw.info.get("bads", []), dtype=str_dt),
         )
         g.attrs["fs"] = sfreq
         g.attrs["units"] = target_units
+        g.attrs["label"] = label
         meas_date = raw.info.get("meas_date")
         g.attrs["start_time_iso"] = (
             meas_date.isoformat() if hasattr(meas_date, "isoformat") else ""
         )
         g.attrs["source_path"] = os.path.abspath(edf_path)
+    build_index(h5_path, gname, n_samples=n_t)
 
-    build_index(h5_path, gname)
+
+def edf_to_segment_h5s(
+    edf_path: str,
+    save_folder: str,
+    target_units: str = "uV",
+    compression: str = "lzf",
+    chunk_sec: float = 5.0,
+    segment_sec: float = 5.0,
+) -> int:
+    """
+    Convert one TUEV EDF to many HDF5 files, one per 5-second segment.
+    Segments are defined by process.py logic: read .rec next to EDF; for each event
+    use (start_time - PAD_SEC, end_time + PAD_SEC); slice into non-overlapping
+    5-second windows and write one H5 per window.
+    Returns the number of H5 files written.
+    """
+    raw = mne.io.read_raw_edf(edf_path, preload=False, verbose="ERROR")
+    existing = set(raw.ch_names)
+    safe_mapping = {k: v for k, v in TUEV_CHANNEL_MAPPING.items() if k in existing}
+    if safe_mapping:
+        raw.rename_channels(safe_mapping)
+    try:
+        signal, sfreq = preprocess_data(raw)
+    except Exception as e:
+        print(f"Preprocess failed for {edf_path}: {e}")
+        return 0
+    if signal is None or sfreq is None:
+        return 0
+
+    n_ch, n_t = signal.shape
+    n_samples_per_segment = int(sfreq * segment_sec)  # 1000 at 200 Hz
+    events = read_events_for_edf(edf_path)
+    if not events:
+        return 0
+
+    edf_stem = os.path.basename(edf_path).replace(".edf", "").replace(".EDF", "").replace(".rec", "")
+    ch_names_after = raw.ch_names
+    written = 0
+    for evt_idx, evt in enumerate(events):
+        start_idx = int(evt["start_sec"] * sfreq)
+        end_idx = int(evt["end_sec"] * sfreq)
+        start_idx = max(0, start_idx)
+        end_idx = min(n_t, end_idx)
+        if end_idx - start_idx < n_samples_per_segment:
+            continue
+        label = evt["label"]
+        chunk_idx = 0
+        for seg_start in range(start_idx, end_idx - n_samples_per_segment + 1, n_samples_per_segment):
+            seg_end = seg_start + n_samples_per_segment
+            slice_signal = signal[:, seg_start:seg_end]
+            h5_name = f"{edf_stem}_evt{evt_idx}_chunk{chunk_idx}_label{label}.h5"
+            h5_path = os.path.join(save_folder, h5_name)
+            write_one_segment_h5(
+                slice_signal,
+                h5_path,
+                ch_names_after,
+                raw,
+                edf_path,
+                label,
+                target_units=target_units,
+                compression=compression,
+                sfreq=sfreq,
+            )
+            written += 1
+            chunk_idx += 1
+    return written
 
 
 EXPECTED_FS = 200
@@ -286,13 +353,26 @@ EXPECTED_DURATION_SEC = 5.0
 EXPECTED_N_SAMPLES = int(EXPECTED_FS * EXPECTED_DURATION_SEC)  # 1000
 
 
+def _parse_segment_h5_stem(stem: str) -> tuple[str, int]:
+    """Parse stem like 'edfname_evt0_chunk0_label1' -> (edfname, 1)."""
+    if "_label" not in stem:
+        return stem, -1
+    pre, label_str = stem.rsplit("_label", 1)
+    try:
+        label = int(label_str)
+        base_stem = pre.rsplit("_evt", 1)[0] if "_evt" in pre else pre
+        return base_stem, label
+    except ValueError:
+        return stem, -1
+
+
 def verify_h5_files(save_folder: str) -> bool:
     """
     Verify each .h5 in save_folder:
     - Length: 5 seconds at 200 Hz (1000 samples per channel).
     - Channels: exactly TUEV_CHANNEL_ORDER, named correctly.
-    - Label: filename (without .h5) exists in load_tuev_labels() and expected label
-      is consistent with the filename (e.g. label appears in filename).
+    - Label: filename stem parses to (base, label); base exists in load_tuev_labels()
+      and label is one of the labels for that file.
     Returns True if all pass, False otherwise.
     """
     labels_df = load_tuev_labels()
@@ -355,22 +435,20 @@ def verify_h5_files(save_folder: str) -> bool:
             all_ok = False
             continue
 
-        # Label vs dataframe: filename must be in labels and label(s) consistent with filename
-        file_rows = labels_df[labels_df["filename"] == stem]
+        # Label vs dataframe: parse segment stem to get base filename and label
+        base_stem, file_label = _parse_segment_h5_stem(stem)
+        file_rows = labels_df[labels_df["filename"] == base_stem]
         if file_rows.empty:
-            print(f"  FAIL {basename}: stem '{stem}' not found in load_tuev_labels() dataframe")
+            print(f"  FAIL {basename}: base stem '{base_stem}' not found in load_tuev_labels() dataframe")
             all_ok = False
             continue
         expected_labels = file_rows["label"].unique().tolist()
-        # Filename should reflect the label (e.g. contain the label or match convention)
-        if len(expected_labels) == 1:
-            if str(expected_labels[0]) not in stem:
-                print(f"  FAIL {basename}: expected label {expected_labels[0]} not found in filename '{stem}'")
-                all_ok = False
-        else:
-            if not any(str(l) in stem for l in expected_labels):
-                print(f"  FAIL {basename}: filename '{stem}' does not contain any of expected labels {expected_labels}")
-                all_ok = False
+        if file_label < 0:
+            print(f"  FAIL {basename}: could not parse label from filename '{stem}'")
+            all_ok = False
+        elif file_label not in expected_labels:
+            print(f"  FAIL {basename}: label {file_label} not in expected labels {expected_labels} for '{base_stem}'")
+            all_ok = False
 
     if all_ok:
         print(f"Verify OK: all {len(h5_files)} files passed.")
@@ -396,16 +474,18 @@ def prepare_tuev(
         print(f"Debug mode: processing only {len(edf_files)} files.")
 
     os.makedirs(save_folder, exist_ok=True)
+    total_h5 = 0
     for edf_file in tqdm(edf_files, desc="TUEV EDF → H5 (per channel)"):
-        basename = os.path.basename(edf_file)
-        name = basename.replace(".edf", "").replace(".rec", "")
-        h5_path = os.path.join(save_folder, name + ".h5")
-        edf_to_h5_per_channel(
+        n = edf_to_segment_h5s(
             edf_file,
-            h5_path,
+            save_folder,
             compression=compression,
             chunk_sec=chunk_sec,
+            segment_sec=5.0,
         )
+        total_h5 += n
+    if total_h5:
+        print(f"Wrote {total_h5} segment H5 files to {save_folder}")
 
 
 def main() -> None:
