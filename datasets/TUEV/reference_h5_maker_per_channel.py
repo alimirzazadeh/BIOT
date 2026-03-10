@@ -222,15 +222,18 @@ def find_rec_files(root_folder: str) -> list[str]:
     return edf_files
 
 
+TUEV_FS = 250.0
+
+
 def preprocess_data(raw: mne.io.Raw) -> tuple[Optional[np.ndarray], Optional[float]]:
     """
     Same pipeline as reference_h5_maker.preprocess_data:
     - Drop channels not in TUEV_CHANNEL_ORDER
-    - Filter 0.1–75 Hz, notch at 60 Hz, resample to 200 Hz.
+    - Filter 0.1–75 Hz, notch at 60 Hz, resample to TUEV_FS (250 Hz).
     Returns (signal shape (n_ch, n_t), sfreq) or (None, None) on failure.
     """
     fs = float(raw.info["sfreq"])
-    target_fs = 200.0
+    target_fs = TUEV_FS
 
     if len(raw.info.get("bads", [])) > 0:
         print(f"Bads: {raw.info['bads']}")
@@ -258,18 +261,17 @@ def preprocess_data(raw: mne.io.Raw) -> tuple[Optional[np.ndarray], Optional[flo
 def build_index(h5_path: str, group_name: str = "recording", n_samples: Optional[int] = None) -> None:
     """
     Create an index dataset under group: one segment [0, n_samples].
-    If n_samples is None, infer from first channel dataset.
+    If n_samples is None, infer from recording/data shape (n_ch, n_t) -> n_t.
     """
     with h5py.File(h5_path, "a") as f:
         if group_name not in f:
             return
         g = f[group_name]
-        ch_names = list(g.keys())
-        data_like = [k for k in ch_names if k not in ("ch_names", "bad_channels", "index")]
-        if not data_like and n_samples is None:
-            return
+        if n_samples is None and "data" in g:
+            # data is (n_ch, n_t)
+            n_samples = g["data"].shape[1]
         if n_samples is None:
-            n_samples = g[data_like[0]].shape[0]
+            return
         if "index" in g:
             del g["index"]
         g.create_dataset("index", data=np.array([[0, n_samples]], dtype=np.int64))
@@ -284,11 +286,14 @@ def write_one_segment_h5(
     label: int,
     target_units: str = "uV",
     compression: str = "lzf",
-    sfreq: float = 200.0,
+    sfreq: float = None,
 ) -> None:
     """
-    Write a single 5-second segment (signal_slice shape (n_ch, 1000)) to one HDF5 file.
+    Write a single 5-second segment (signal_slice shape (n_ch, n_t)) to one HDF5 file.
+    recording/ contains: data (n_ch, n_t), ch_names, bad_channels, index.
     """
+    if sfreq is None:
+        sfreq = TUEV_FS
     n_ch, n_t = signal_slice.shape
     signal_slice = signal_slice.astype(np.float32)
     if target_units == "uV":
@@ -299,14 +304,12 @@ def write_one_segment_h5(
     with h5py.File(h5_path, "w") as f:
         gname = "recording"
         g = f.create_group(gname)
-        for i, ch in enumerate(ch_names):
-            dset = g.create_dataset(
-                ch,
-                data=signal_slice[i],
-                chunks=(chunk_t,),
-                compression=compression,
-            )
-            dset.attrs["channel"] = ch
+        g.create_dataset(
+            "data",
+            data=signal_slice,
+            chunks=(1, chunk_t),
+            compression=compression,
+        )
         g.create_dataset("ch_names", data=np.array(ch_names, dtype=str_dt))
         g.create_dataset(
             "bad_channels",
@@ -360,7 +363,7 @@ def edf_to_segment_h5s(
     signal = signal[order_idx]
     ch_names_after = list(TUEV_CHANNEL_ORDER)
 
-    n_samples_per_segment = int(sfreq * segment_sec)  # 1000 at 200 Hz
+    n_samples_per_segment = int(sfreq * segment_sec)  # 1250 at 250 Hz
     events = read_events_for_edf(edf_path)
     if not events:
         return 0
@@ -397,9 +400,9 @@ def edf_to_segment_h5s(
     return written
 
 
-EXPECTED_FS = 200
+EXPECTED_FS = TUEV_FS
 EXPECTED_DURATION_SEC = 5.0
-EXPECTED_N_SAMPLES = int(EXPECTED_FS * EXPECTED_DURATION_SEC)  # 1000
+EXPECTED_N_SAMPLES = int(EXPECTED_FS * EXPECTED_DURATION_SEC)  # 1250
 
 
 def _parse_segment_h5_stem(stem: str) -> tuple[str, int]:
@@ -418,7 +421,7 @@ def _parse_segment_h5_stem(stem: str) -> tuple[str, int]:
 def verify_h5_files(save_folder: str, data_folder: Optional[str] = None) -> bool:
     """
     Verify each .h5 in save_folder:
-    - Length: 5 seconds at 200 Hz (1000 samples per channel).
+    - Length: 5 seconds at TUEV_FS (250 Hz, 1250 samples).
     - Channels: exactly TUEV_CHANNEL_ORDER, named correctly.
     - Label: filename stem parses to (base, label); base exists in load_tuev_labels()
       and label is one of the labels for that file.
@@ -456,25 +459,27 @@ def verify_h5_files(save_folder: str, data_folder: Optional[str] = None) -> bool
                     all_ok = False
                     continue
 
-                # ch_names
+                # recording must have: data, ch_names, bad_channels, index
+                if "data" not in g:
+                    print(f"  FAIL {basename}: missing 'recording/data' dataset")
+                    all_ok = False
+                    continue
+                data_dset = g["data"]
+                if data_dset.ndim != 2:
+                    print(f"  FAIL {basename}: recording/data must be 2D (n_ch, n_t), got ndim={data_dset.ndim}")
+                    all_ok = False
+                    continue
+                n_samples = data_dset.shape[1]
+
                 if "ch_names" in g:
                     ch_names = list(g["ch_names"].asstr()[:])
                 else:
-                    data_like = [k for k in g.keys() if k in TUEV_CHANNEL_ORDER]
-                    ch_names = sorted(data_like) if data_like else []
+                    ch_names = []
 
                 if set(ch_names) != set(TUEV_CHANNEL_ORDER) or len(ch_names) != len(TUEV_CHANNEL_ORDER):
                     print(f"  FAIL {basename}: ch_names mismatch. Got {len(ch_names)} channels, expected {len(TUEV_CHANNEL_ORDER)}. Names: {ch_names}")
                     all_ok = False
                     continue
-
-                # length: 5 seconds
-                first_ch = TUEV_CHANNEL_ORDER[0]
-                if first_ch not in g:
-                    print(f"  FAIL {basename}: missing channel dataset {first_ch}")
-                    all_ok = False
-                    continue
-                n_samples = g[first_ch].shape[0]
                 if n_samples != EXPECTED_N_SAMPLES:
                     print(f"  FAIL {basename}: n_samples={n_samples}, expected {EXPECTED_N_SAMPLES} (5 sec at {EXPECTED_FS} Hz)")
                     all_ok = False
