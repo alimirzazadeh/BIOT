@@ -54,9 +54,13 @@ def merge_adjacent_segments(df, fs=200):
     return out[[c for c in df.columns if c in out.columns]]
 
 
-def load_tuev_labels(fs=250):
-    """Load TUEV annotations. Returns DataFrame with filename, start_time, end_time, label (int). Adjacent same-label segments are merged."""
-    txt_dir = '/orcd/compute/dinaktbi/001/2026/EEG_FM/EXTERNAL_DATASETS/TUEV/data/v2.0.1/edf/'
+def load_tuev_labels(fs=250, data_folder: Optional[str] = None):
+    """Load TUEV annotations. Returns DataFrame with filename, start_time, end_time, label (int). Adjacent same-label segments are merged.
+    If data_folder is given, discover .rec files under it; otherwise use default path."""
+    if data_folder is not None:
+        txt_dir = data_folder
+    else:
+        txt_dir = '/orcd/compute/dinaktbi/001/2026/EEG_FM/EXTERNAL_DATASETS/TUEV/data/v2.0.1/edf/'
     txt_files = [os.path.join(item[0], ii) for item in os.walk(txt_dir) for ii in item[2] if ii.endswith('.rec')]
     df_list = []
     for rec_file in txt_files:
@@ -366,16 +370,17 @@ def _parse_segment_h5_stem(stem: str) -> tuple[str, int]:
         return stem, -1
 
 
-def verify_h5_files(save_folder: str) -> bool:
+def verify_h5_files(save_folder: str, data_folder: Optional[str] = None) -> bool:
     """
     Verify each .h5 in save_folder:
     - Length: 5 seconds at 200 Hz (1000 samples per channel).
     - Channels: exactly TUEV_CHANNEL_ORDER, named correctly.
     - Label: filename stem parses to (base, label); base exists in load_tuev_labels()
       and label is one of the labels for that file.
+    If data_folder is given, labels are loaded from .rec files under it (same as creation).
     Returns True if all pass, False otherwise.
     """
-    labels_df = load_tuev_labels()
+    labels_df = load_tuev_labels(data_folder=data_folder)
     h5_files = []
     for dirpath, _dirnames, filenames in os.walk(save_folder):
         for f in filenames:
@@ -568,7 +573,7 @@ def main() -> None:
         print(f"Done. H5 files written to {save_folder}")
 
     if args.verify:
-        ok = verify_h5_files(save_folder)
+        ok = verify_h5_files(save_folder, data_folder=data_folder)
         if not ok:
             raise SystemExit(1)
 
