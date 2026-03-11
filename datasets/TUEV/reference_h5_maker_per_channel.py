@@ -261,15 +261,15 @@ def preprocess_data(raw: mne.io.Raw) -> tuple[Optional[np.ndarray], Optional[flo
 def build_index(h5_path: str, group_name: str = "recording", n_samples: Optional[int] = None) -> None:
     """
     Create an index dataset under group: one segment [0, n_samples].
-    If n_samples is None, infer from recording/data shape (n_ch, n_t) -> n_t.
+    If n_samples is None, infer from recording/data shape (n_t, n_ch) -> n_t.
     """
     with h5py.File(h5_path, "a") as f:
         if group_name not in f:
             return
         g = f[group_name]
         if n_samples is None and "data" in g:
-            # data is (n_ch, n_t)
-            n_samples = g["data"].shape[1]
+            # data is (sequence, channels) i.e. (n_t, n_ch)
+            n_samples = g["data"].shape[0]
         if n_samples is None:
             return
         if "index" in g:
@@ -290,7 +290,7 @@ def write_one_segment_h5(
 ) -> None:
     """
     Write a single 5-second segment (signal_slice shape (n_ch, n_t)) to one HDF5 file.
-    recording/ contains: data (n_ch, n_t), ch_names, bad_channels, index.
+    recording/ contains: data (n_t, n_ch) i.e. (sequence, channels), ch_names, bad_channels, index.
     """
     if sfreq is None:
         sfreq = TUEV_FS
@@ -298,6 +298,8 @@ def write_one_segment_h5(
     signal_slice = signal_slice.astype(np.float32)
     if target_units == "uV":
         signal_slice *= 1e6
+    # Store as (sequence, channels) i.e. (n_t, n_ch)
+    data_stored = np.ascontiguousarray(signal_slice.T)  # (n_t, n_ch)
     str_dt = h5py.string_dtype("utf-8")
     chunk_t = min(n_t, max(1, int(sfreq * 5.0)))
     os.makedirs(os.path.dirname(h5_path) or ".", exist_ok=True)
@@ -306,8 +308,8 @@ def write_one_segment_h5(
         g = f.create_group(gname)
         g.create_dataset(
             "data",
-            data=signal_slice,
-            chunks=(1, chunk_t),
+            data=data_stored,
+            chunks=(chunk_t, n_ch),
             compression=compression,
         )
         g.create_dataset("ch_names", data=np.array(ch_names, dtype=str_dt))
@@ -459,17 +461,17 @@ def verify_h5_files(save_folder: str, data_folder: Optional[str] = None) -> bool
                     all_ok = False
                     continue
 
-                # recording must have: data, ch_names, bad_channels, index
+                # recording must have: data, ch_names, bad_channels, index (data = sequence, channels = n_t, n_ch)
                 if "data" not in g:
                     print(f"  FAIL {basename}: missing 'recording/data' dataset")
                     all_ok = False
                     continue
                 data_dset = g["data"]
                 if data_dset.ndim != 2:
-                    print(f"  FAIL {basename}: recording/data must be 2D (n_ch, n_t), got ndim={data_dset.ndim}")
+                    print(f"  FAIL {basename}: recording/data must be 2D (n_t, n_ch), got ndim={data_dset.ndim}")
                     all_ok = False
                     continue
-                n_samples = data_dset.shape[1]
+                n_samples = data_dset.shape[0]
 
                 if "ch_names" in g:
                     ch_names = list(g["ch_names"].asstr()[:])

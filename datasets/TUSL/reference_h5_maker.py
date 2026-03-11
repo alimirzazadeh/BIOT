@@ -3,7 +3,7 @@ TUSL dataset → HDF5 segment files.
 
 Similar to TUEV/reference_h5_maker_per_channel.py: finds EDFs under data_folder,
 pairs each with its .tse_agg label file (same stem, same directory), and writes
-one H5 per 5-second segment. recording/ contains: data (n_ch, n_t), ch_names,
+one H5 per 5-second segment. recording/ contains: data (n_t, n_ch) i.e. (sequence, channels), ch_names,
 bad_channels, index. fs=250 Hz.
 
 .tse_agg format (space-separated):
@@ -152,12 +152,13 @@ def preprocess_data(raw: mne.io.Raw) -> tuple[Optional[np.ndarray], Optional[flo
 
 
 def build_index(h5_path: str, group_name: str = "recording", n_samples: Optional[int] = None) -> None:
+    """Infer n_samples from data shape (n_t, n_ch) -> shape[0]."""
     with h5py.File(h5_path, "a") as f:
         if group_name not in f:
             return
         g = f[group_name]
         if n_samples is None and "data" in g:
-            n_samples = g["data"].shape[1]
+            n_samples = g["data"].shape[0]
         if n_samples is None:
             return
         if "index" in g:
@@ -176,17 +177,18 @@ def write_one_segment_h5(
     compression: str = "lzf",
     sfreq: float = TUSL_FS,
 ) -> None:
-    """Write one 5-second segment to H5: recording/data (n_ch, n_t), ch_names, bad_channels, index."""
+    """Write one 5-second segment to H5: recording/data (n_t, n_ch) i.e. (sequence, channels), ch_names, bad_channels, index."""
     n_ch, n_t = signal_slice.shape
     signal_slice = signal_slice.astype(np.float32)
     if target_units == "uV":
         signal_slice *= 1e6
+    data_stored = np.ascontiguousarray(signal_slice.T)  # (n_t, n_ch)
     str_dt = h5py.string_dtype("utf-8")
     chunk_t = min(n_t, max(1, int(sfreq * 5.0)))
     os.makedirs(os.path.dirname(h5_path) or ".", exist_ok=True)
     with h5py.File(h5_path, "w") as f:
         g = f.create_group("recording")
-        g.create_dataset("data", data=signal_slice, chunks=(1, chunk_t), compression=compression)
+        g.create_dataset("data", data=data_stored, chunks=(chunk_t, n_ch), compression=compression)
         g.create_dataset("ch_names", data=np.array(ch_names, dtype=str_dt))
         g.create_dataset("bad_channels", data=np.array(raw.info.get("bads", []), dtype=str_dt))
         g.attrs["fs"] = sfreq
@@ -336,7 +338,7 @@ def verify_h5_files(save_folder: str, data_folder: Optional[str] = None) -> bool
                     print(f"  FAIL {basename}: data ndim={data_dset.ndim}")
                     all_ok = False
                     continue
-                n_samples = data_dset.shape[1]
+                n_samples = data_dset.shape[0]
                 if n_samples != EXPECTED_N_SAMPLES:
                     print(f"  FAIL {basename}: n_samples={n_samples}, expected {EXPECTED_N_SAMPLES}")
                     all_ok = False
