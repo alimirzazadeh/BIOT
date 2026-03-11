@@ -558,16 +558,17 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="TUEV EDF → HDF5 with one dataset per channel (reference processing)."
     )
+    _tuev_base = "/orcd/compute/dinaktbi/001/2026/EEG_FM/EXTERNAL_DATASETS/TUEV"
     parser.add_argument(
         "--data_folder",
         type=str,
-        default='/orcd/compute/dinaktbi/001/2026/EEG_FM/EXTERNAL_DATASETS/TUEV/data/',
+        default=os.path.join(_tuev_base, "data"),
         help="Root folder containing TUEV EDF (or .rec) files",
     )
     parser.add_argument(
         "--save_folder",
         type=str,
-        default='/orcd/compute/dinaktbi/001/2026/EEG_FM/EXTERNAL_DATASETS/TUEV/h5/',
+        default=os.path.join(_tuev_base, "h5"),
         help="Folder where to write .h5 files",
     )
     parser.add_argument(
@@ -606,13 +607,9 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.prepare_tuev:
-        # Default paths similar to reference_h5_maker.py
-        base = os.environ.get(
-            "EXTERNAL_DATASETS",
-            os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "EXTERNAL_DATASETS"),
-        )
-        data_folder = os.path.join(base, "TUEV", "data")
-        save_folder = os.path.join(base, "TUEV", "h5")
+        EXTERNAL_DATASETS = "/orcd/compute/dinaktbi/001/2026/EEG_FM/EXTERNAL_DATASETS"
+        data_folder = os.path.join(EXTERNAL_DATASETS, "TUEV", "data")
+        save_folder = os.path.join(EXTERNAL_DATASETS, "TUEV", "h5")
     else:
         data_folder = args.data_folder
         save_folder = args.save_folder

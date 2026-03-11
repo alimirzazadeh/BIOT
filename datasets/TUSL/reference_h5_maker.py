@@ -70,6 +70,10 @@ TUSL_FS = 250.0
 SEGMENT_SEC = 5.0
 EXPECTED_N_SAMPLES = int(TUSL_FS * SEGMENT_SEC)  # 1250
 
+EXTERNAL_DATASETS = "/orcd/compute/dinaktbi/001/2026/EEG_FM/EXTERNAL_DATASETS"
+TUSL_DATA_DEFAULT = os.path.join(EXTERNAL_DATASETS, "TUSL", "data")
+TUSL_H5_DEFAULT = os.path.join(EXTERNAL_DATASETS, "TUSL", "h5")
+
 
 def _label_str_to_int(s: str) -> int:
     """Map .tse_agg label string to int. Unknown -> 0."""
@@ -269,7 +273,7 @@ def load_tusl_labels(data_folder: Optional[str] = None) -> pd.DataFrame:
     filename (stem), start_time, end_time, label (int).
     """
     if data_folder is None:
-        data_folder = "/orcd/compute/dinaktbi/001/2026/EEG_FM/EXTERNAL_DATASETS/TUSL/data/v2.0.1/edf"
+        data_folder = os.path.join(TUSL_DATA_DEFAULT, "v2.0.1", "edf")
     rows = []
     for dirpath, _dirnames, filenames in os.walk(data_folder):
         for f in filenames:
@@ -399,8 +403,8 @@ def prepare_tusl(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="TUSL EDF → HDF5 segments (recording/data, 250 Hz).")
-    parser.add_argument("--data_folder", type=str, default="/orcd/compute/dinaktbi/001/2026/EEG_FM/EXTERNAL_DATASETS/TUSL/data/")
-    parser.add_argument("--save_folder", type=str, default="/orcd/compute/dinaktbi/001/2026/EEG_FM/EXTERNAL_DATASETS/TUSL/h5/")
+    parser.add_argument("--data_folder", type=str, default=TUSL_DATA_DEFAULT)
+    parser.add_argument("--save_folder", type=str, default=TUSL_H5_DEFAULT)
     parser.add_argument("--compression", type=str, default="lzf", choices=("lzf", "gzip", "none"))
     parser.add_argument("--debug", action="store_true", help="Process only first 10 EDFs")
     parser.add_argument("--verify", action="store_true", help="Verify H5s (5s, channels, labels)")
